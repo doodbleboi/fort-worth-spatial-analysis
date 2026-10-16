@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Regional Tarrant County Spatial Explorer: Fort Worth, Arlington & Pantego
-Multi-source geospatial ETL pipeline powered by Fort Worth GIS & NCTCOG Regional Open Data.
+Multi-source geospatial ETL pipeline with client-side attribute filtering.
 """
 
 import sys
@@ -19,13 +19,12 @@ from folium.plugins import (
 # ---------------------------------------------------------------------------
 # Endpoints & Configurations
 # ---------------------------------------------------------------------------
-# 1. Fort Worth Official Council Districts (MapServer)
 FW_ENDPOINT = (
     "https://mapit.fortworthtexas.gov/ags/rest/services/CIVIC/"
     "OpenData_Boundaries/MapServer/2/query"
 )
 
-# 2. NCTCOG Regional Municipal Boundaries (Authoritative source for Arlington & Pantego)
+# NCTCOG Regional Municipal Boundaries (Authoritative source for North Texas cities)
 NCTCOG_MUNIS_ENDPOINT = (
     "https://services.arcgis.com/rOo16HdIMDhWgIKI/arcgis/rest/services/"
     "City_Limits/FeatureServer/0/query"
@@ -34,18 +33,16 @@ NCTCOG_MUNIS_ENDPOINT = (
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "Regional-GIS-Explorer/3.0 (Tarrant County Spatial Analytics)"
+        "Regional-GIS-Explorer/4.0 (Tarrant County Analytics)"
     )
 }
 
 OUTPUT_FILE = "index.html"
-REGIONAL_CENTER = [32.7357, -97.2000]  # Balanced centroid of Fort Worth, Arlington, and Pantego
+REGIONAL_CENTER = [32.7357, -97.2000]
 
-# Area conversion constants (from sq ft)
 SQ_FT_TO_SQ_MILES = 1 / 27878400
 SQ_FT_TO_ACRES = 1 / 43560
 
-# Free, high-performance Esri Basemaps (No API keys required, no localhost/file:// blocks)
 BASEMAPS = {
     "Esri Light Gray": {
         "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
@@ -63,7 +60,7 @@ BASEMAPS = {
 
 
 def query_arcgis_endpoint(url: str, params: dict, label: str) -> gpd.GeoDataFrame:
-    """Queries an ArcGIS REST endpoint and constructs a normalized WGS84 GeoDataFrame."""
+    """Queries an ArcGIS REST endpoint and returns a GeoDataFrame."""
     print(f"Fetching {label}...")
     try:
         response = requests.get(url, params=params, headers=HEADERS, timeout=30)
@@ -71,12 +68,12 @@ def query_arcgis_endpoint(url: str, params: dict, label: str) -> gpd.GeoDataFram
         payload = response.json()
 
         if "error" in payload:
-            print(f"Notice for {label}: {payload['error'].get('message', payload['error'])}", file=sys.stderr)
+            print(f"Server error for {label}: {payload['error'].get('message', payload['error'])}", file=sys.stderr)
             return gpd.GeoDataFrame()
 
         features = payload.get("features", [])
         if not features:
-            print(f"Warning: No spatial features found for {label}.", file=sys.stderr)
+            print(f"Notice: No features returned for {label}.", file=sys.stderr)
             return gpd.GeoDataFrame()
 
         gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
@@ -85,13 +82,35 @@ def query_arcgis_endpoint(url: str, params: dict, label: str) -> gpd.GeoDataFram
         return gdf
 
     except Exception as err:
-        print(f"Error fetching {label}: {err}", file=sys.stderr)
+        print(f"Notice: Query failed for {label} ({err}).", file=sys.stderr)
         return gpd.GeoDataFrame()
+
+
+def filter_city_polygon(gdf: gpd.GeoDataFrame, city_name: str) -> gpd.GeoDataFrame:
+    """Safely finds and filters a municipality across any text attribute column."""
+    if gdf.empty:
+        return gpd.GeoDataFrame()
+    
+    target = city_name.strip().upper()
+    
+    # Check every string column for the target municipality name
+    mask = False
+    for col in gdf.columns:
+        if col == "geometry":
+            continue
+        try:
+            col_match = gdf[col].astype(str).str.strip().str.upper() == target
+            mask = mask | col_match
+        except Exception:
+            continue
+            
+    matched = gdf[mask].copy()
+    return matched
 
 
 def build_regional_map():
     # -----------------------------------------------------------------------
-    # 1. Fetch & Enrich Datasets
+    # 1. Fetch Datasets
     # -----------------------------------------------------------------------
     # A. Fort Worth Council Districts
     fw_gdf = query_arcgis_endpoint(
@@ -115,37 +134,30 @@ def build_regional_map():
             fw_gdf["Sq_Miles"] = "N/A"
             fw_gdf["Acres"] = "N/A"
 
-    # B. City of Arlington Boundary (via NCTCOG Regional Layer)
-    arlington_gdf = query_arcgis_endpoint(
+    # B. Regional Municipal Layer (Fetch without complex WHERE clauses)
+    regional_munis = query_arcgis_endpoint(
         NCTCOG_MUNIS_ENDPOINT,
         params={
-            "where": "UPPER(CITY_NAME) = 'ARLINGTON' OR UPPER(NAME) = 'ARLINGTON'",
+            "where": "1=1",
             "outFields": "*",
             "f": "geojson",
             "returnGeometry": "true"
         },
-        label="City of Arlington Boundary"
+        label="NCTCOG Regional Boundaries"
     )
 
+    # Client-side filtering across attributes
+    arlington_gdf = filter_city_polygon(regional_munis, "Arlington")
     if not arlington_gdf.empty:
         arlington_gdf["Jurisdiction"] = "City of Arlington"
         arlington_gdf["Type"] = "Incorporated Municipal Boundary"
+        print(f"--> Extracted Arlington municipal boundary ({len(arlington_gdf)} polygon).")
 
-    # C. Town of Pantego Enclave (via NCTCOG Regional Layer)
-    pantego_gdf = query_arcgis_endpoint(
-        NCTCOG_MUNIS_ENDPOINT,
-        params={
-            "where": "UPPER(CITY_NAME) = 'PANTEGO' OR UPPER(NAME) = 'PANTEGO'",
-            "outFields": "*",
-            "f": "geojson",
-            "returnGeometry": "true"
-        },
-        label="Town of Pantego Enclave"
-    )
-
+    pantego_gdf = filter_city_polygon(regional_munis, "Pantego")
     if not pantego_gdf.empty:
         pantego_gdf["Jurisdiction"] = "Town of Pantego"
         pantego_gdf["Type"] = "Incorporated Town (Enclave in Arlington)"
+        print(f"--> Extracted Pantego municipal boundary ({len(pantego_gdf)} polygon).")
 
     # -----------------------------------------------------------------------
     # 2. Map Canvas Setup & Basemaps
@@ -170,7 +182,7 @@ def build_regional_map():
     # -----------------------------------------------------------------------
     # 3. Vector Layers
     # -----------------------------------------------------------------------
-    # Layer 1: Fort Worth Council Districts (Sapphire Blue)
+    # Layer 1: Fort Worth Council Districts
     if not fw_gdf.empty:
         fw_group = folium.FeatureGroup(name="Fort Worth Council Districts", show=True)
         folium.GeoJson(
@@ -204,7 +216,7 @@ def build_regional_map():
         ).add_to(fw_group)
         fw_group.add_to(m)
 
-    # Layer 2: Arlington Boundary (Warm Terracotta / Coral)
+    # Layer 2: Arlington Boundary
     if not arlington_gdf.empty:
         arl_group = folium.FeatureGroup(name="City of Arlington Boundary", show=True)
         folium.GeoJson(
@@ -238,120 +250,4 @@ def build_regional_map():
         ).add_to(arl_group)
         arl_group.add_to(m)
 
-    # Layer 3: Town of Pantego Enclave (Emerald Green)
-    if not pantego_gdf.empty:
-        pantego_group = folium.FeatureGroup(name="Town of Pantego (Enclave)", show=True)
-        folium.GeoJson(
-            pantego_gdf,
-            style_function=lambda x: {
-                "fillColor": "#00a86b",
-                "color": "#004d30",
-                "weight": 2.5,
-                "fillOpacity": 0.70
-            },
-            highlight_function=lambda x: {
-                "fillColor": "#39ff14",
-                "color": "#000000",
-                "weight": 3.5,
-                "fillOpacity": 0.90
-            },
-            tooltip=folium.GeoJsonTooltip(
-                fields=["Jurisdiction", "Type"],
-                aliases=["Community:", "Boundary Status:"],
-                style=(
-                    "background: rgba(255, 255, 255, 0.95); font-family: -apple-system, BlinkMacSystemFont, "
-                    "'Segoe UI', Roboto, sans-serif; font-size: 12px; padding: 10px; border-radius: 6px; "
-                    "box-shadow: 0 4px 14px rgba(0,0,0,0.25);"
-                ),
-                sticky=True
-            ),
-            popup=folium.Popup(
-                "<strong>Town of Pantego</strong><br>Incorporated Town (Enclave within Arlington).<br>Governed by an at-large Town Council.",
-                max_width=300
-            )
-        ).add_to(pantego_group)
-        pantego_group.add_to(m)
-
-    # -----------------------------------------------------------------------
-    # 4. Interactive GIS Tools
-    # -----------------------------------------------------------------------
-    # Address Search / Geocoder
-    Geocoder(add_marker=True, collapsed=False, position="topleft").add_to(m)
-
-    # Fullscreen Button
-    Fullscreen(position="topleft", title="Full Screen", title_cancel="Exit Full Screen").add_to(m)
-
-    # Distance and Area Measurement Ruler
-    MeasureControl(
-        position="topleft",
-        primary_length_unit="miles",
-        secondary_length_unit="feet",
-        primary_area_unit="sqmiles",
-        secondary_area_unit="acres"
-    ).add_to(m)
-
-    # GPS Geolocation / "Locate Me" Button
-    LocateControl(auto_start=False, position="topleft").add_to(m)
-
-    # Corner Overview MiniMap
-    MiniMap(
-        toggle_display=True,
-        tile_layer=folium.TileLayer(
-            tiles=BASEMAPS["Esri Light Gray"]["url"],
-            attr=BASEMAPS["Esri Light Gray"]["attr"]
-        ),
-        position="bottomright"
-    ).add_to(m)
-
-    # Layer Toggle Menu (Top Right)
-    folium.LayerControl(position="topright", collapsed=False).add_to(m)
-
-    # -----------------------------------------------------------------------
-    # 5. Floating Title & Legend HUD
-    # -----------------------------------------------------------------------
-    title_html = """
-    <div style="
-        position: fixed;
-        bottom: 25px;
-        left: 25px;
-        z-index: 1000;
-        background: rgba(255, 255, 255, 0.94);
-        padding: 14px 18px;
-        border-radius: 8px;
-        box-shadow: 0 4px 18px rgba(0,0,0,0.25);
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-        line-height: 1.4;
-        max-width: 330px;
-        backdrop-filter: blur(4px);
-    ">
-        <h4 style="margin: 0 0 6px 0; color: #111; font-size: 15px; font-weight: 700;">
-            Tarrant County Municipal Explorer
-        </h4>
-        <div style="font-size: 12px; color: #444; margin-bottom: 8px;">
-            Boundary comparison: <b>Fort Worth</b>, <b>Arlington</b>, &amp; <b>Pantego</b>.
-        </div>
-        <div style="display: flex; flex-direction: column; gap: 5px; font-size: 11px;">
-            <div style="display: flex; align-items: center; gap: 8px;">
-                <span style="display: inline-block; width: 14px; height: 14px; background: #1f77b4; opacity: 0.7; border: 1px solid #0d47a1; border-radius: 2px;"></span>
-                <span>Fort Worth Council Districts (10)</span>
-            </div>
-            <div style="display: flex; align-items: center; gap: 8px;">
-                <span style="display: inline-block; width: 14px; height: 14px; background: #d95f02; opacity: 0.7; border: 1px solid #993404; border-radius: 2px;"></span>
-                <span>City of Arlington Boundary</span>
-            </div>
-            <div style="display: flex; align-items: center; gap: 8px;">
-                <span style="display: inline-block; width: 14px; height: 14px; background: #00a86b; opacity: 0.8; border: 1px solid #004d30; border-radius: 2px;"></span>
-                <span>Town of Pantego (Enclave)</span>
-            </div>
-        </div>
-    </div>
-    """
-    m.get_root().html.add_child(folium.Element(title_html))
-
-    print(f"Exporting compiled web map to {OUTPUT_FILE}...")
-    m.save(OUTPUT_FILE)
-    print("Execution complete! Open index.html to view the updated map.")
-
-
-if __name__ == "__main__":
-    build_regional_map()
+    # Layer 3: Town of Pantego Enclave
