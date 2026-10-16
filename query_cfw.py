@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Fort Worth Council Districts Spatial Analysis & Interactive Map Generator
-
-Queries official Fort Worth MapServer REST APIs, parses GeoJSON payloads into
-GeoPandas, and generates a responsive Folium web map.
+"""
+Fort Worth Council Districts Spatial Analysis & Interactive Map Generator
+Includes live address searching (Geocoder) and an overview MiniMap.
 """
 
 import sys
-import folium
-import geopandas as gpd
 import requests
+import geopandas as gpd
+import folium
+from folium.plugins import Geocoder, MiniMap
 
 # ---------------------------------------------------------
 # Configuration & Endpoints
@@ -39,143 +39,124 @@ SQ_FT_TO_SQ_MILES = 1 / 27878400
 
 # Distinct color palette for council districts
 PALETTE = [
-    "#2b5c8f",
-    "#d95f02",
-    "#7570b3",
-    "#e7298a",
-    "#66a61e",
-    "#e6ab02",
-    "#a6761d",
-    "#1b9e77",
-    "#e41a1c",
-    "#377eb8",
-    "#4daf4a",
-    "#984ea3",
+    "#2b5c8f", "#d95f02", "#7570b3", "#e7298a",
+    "#66a61e", "#e6ab02", "#a6761d", "#1b9e77",
+    "#e41a1c", "#377eb8", "#4daf4a", "#984ea3"
 ]
 
 
 def fetch_spatial_data(url: str, params: dict) -> gpd.GeoDataFrame:
-  """Queries the ArcGIS MapServer endpoint and safely parses the payload into a GeoDataFrame."""
-  print(f"[1/4] Fetching data from {url.split('?')[0]}...")
+    """Queries the ArcGIS MapServer endpoint and parses into a GeoDataFrame."""
+    print(f"[1/4] Fetching data from {url.split('?')[0]}...")
+    try:
+        response = requests.get(url, params=params, headers=HEADERS, timeout=30)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as err:
+        print(f"Error querying endpoint: {err}", file=sys.stderr)
+        sys.exit(1)
 
-  try:
-    response = requests.get(url, params=params, headers=HEADERS, timeout=30)
-    response.raise_for_status()
-  except requests.exceptions.RequestException as err:
-    print(f"Error querying endpoint: {err}", file=sys.stderr)
-    sys.exit(1)
+    payload = response.json()
+    if "error" in payload:
+        error_msg = payload["error"].get("message", payload["error"])
+        print(f"ArcGIS REST Error: {error_msg}", file=sys.stderr)
+        sys.exit(1)
 
-  payload = response.json()
+    features = payload.get("features", [])
+    if not features:
+        print("Warning: No features returned from endpoint.", file=sys.stderr)
+        return gpd.GeoDataFrame()
 
-  if "error" in payload:
-    error_msg = payload["error"].get("message", payload["error"])
-    print(f"ArcGIS REST Error: {error_msg}", file=sys.stderr)
-    sys.exit(1)
-
-  features = payload.get("features", [])
-  if not features:
-    print("Warning: No features returned from endpoint.", file=sys.stderr)
-    return gpd.GeoDataFrame()
-
-  gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
-  return gdf
+    return gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
 
 
 def clean_and_enrich_data(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-  """Cleans columns, calculates area in square miles, and assigns display styling."""
-  print(f"[2/4] Processing {len(gdf)} district polygons...")
+    """Cleans columns, calculates area in sq miles, and assigns display styling."""
+    print(f"[2/4] Processing {len(gdf)} district polygons...")
+    gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()].copy()
 
-  # Drop null/empty geometries
-  gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()].copy()
+    if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
 
-  # Ensure coordinate reference system is WGS84 for web mapping
-  if gdf.crs is None or gdf.crs.to_epsg() != 4326:
-    gdf = gdf.to_crs(epsg=4326)
+    if "DISTRICT" in gdf.columns:
+        gdf["display_district"] = gdf["DISTRICT"].astype(str).str.replace(".0", "", regex=False)
+    else:
+        gdf["display_district"] = gdf.index.astype(str)
 
-  # Format District labels cleanly
-  if "DISTRICT" in gdf.columns:
-    gdf["display_district"] = (
-        gdf["DISTRICT"].astype(str).str.replace(".0", "", regex=False)
-    )
-  else:
-    gdf["display_district"] = gdf.index.astype(str)
+    area_col = "SHAPE.STArea()"
+    if area_col in gdf.columns:
+        gdf["area_sq_mi"] = (gdf[area_col].astype(float) * SQ_FT_TO_SQ_MILES).round(2)
+    else:
+        gdf["area_sq_mi"] = "N/A"
 
-  # Calculate approximate square mileage from Esri Shape Area
-  area_col = "SHAPE.STArea()"
-  if area_col in gdf.columns:
-    gdf["area_sq_mi"] = (
-        gdf[area_col].astype(float) * SQ_FT_TO_SQ_MILES
-    ).round(2)
-  else:
-    gdf["area_sq_mi"] = "N/A"
-
-  # Assign discrete visual colors
-  gdf["fill_color"] = [PALETTE[i % len(PALETTE)] for i in range(len(gdf))]
-
-  return gdf
+    gdf["fill_color"] = [PALETTE[i % len(PALETTE)] for i in range(len(gdf))]
+    return gdf
 
 
 def build_map(gdf: gpd.GeoDataFrame, output_path: str):
-  """Renders the spatial layer into an interactive Folium web map."""
-  print("[3/4] Rendering interactive Leaflet/Folium map...")
+    """Renders the spatial layer into an interactive Folium web map with search and minimap."""
+    print("[3/4] Rendering interactive Leaflet/Folium map...")
 
-  # Initialize map using open-access OpenStreetMap tiles
-  m = folium.Map(
-      location=FT_WORTH_COORDS,
-      zoom_start=11,
-      tiles="OpenStreetMap",
-      control_scale=True,
-  )
+    m = folium.Map(
+        location=FT_WORTH_COORDS,
+        zoom_start=11,
+        tiles="OpenStreetMap",
+        control_scale=True,
+    )
 
-  # Add district boundaries with hover highlight and styled tooltips
-  folium.GeoJson(
-      gdf,
-      name="City Council Districts",
-      style_function=lambda feature: {
-          "fillColor": feature["properties"]["fill_color"],
-          "color": "#1a1a1a",
-          "weight": 1.5,
-          "fillOpacity": 0.45,
-      },
-      highlight_function=lambda feature: {
-          "fillColor": "#ffff00",
-          "color": "#000000",
-          "weight": 3,
-          "fillOpacity": 0.7,
-      },
-      tooltip=folium.GeoJsonTooltip(
-          fields=["display_district", "NAME", "area_sq_mi"],
-          aliases=["Council District:", "Name:", "Approx. Sq Miles:"],
-          style=(
-              "background-color: white; color: #333333; font-family: sans-serif;"
-              " font-size: 12px; padding: 8px; border-radius: 4px; box-shadow:"
-              " 0 2px 4px rgba(0,0,0,0.2);"
-          ),
-          sticky=True,
-      ),
-      popup=folium.GeoJsonPopup(
-          fields=["display_district", "NAME", "area_sq_mi", "DATESTAMP"],
-          aliases=["District:", "Council Member / Title:", "Area (sq mi):", "Last Updated:"],
-          localize=True,
-      ),
-  ).add_to(m)
+    # 1. District Boundaries Layer
+    folium.GeoJson(
+        gdf,
+        name="City Council Districts",
+        style_function=lambda feature: {
+            "fillColor": feature["properties"]["fill_color"],
+            "color": "#1a1a1a",
+            "weight": 1.5,
+            "fillOpacity": 0.45,
+        },
+        highlight_function=lambda feature: {
+            "fillColor": "#ffff00",
+            "color": "#000000",
+            "weight": 3,
+            "fillOpacity": 0.7,
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=["display_district", "NAME", "area_sq_mi"],
+            aliases=["Council District:", "Name:", "Approx. Sq Miles:"],
+            style=(
+                "background-color: white; color: #333333; font-family: sans-serif; "
+                "font-size: 12px; padding: 8px; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.2);"
+            ),
+            sticky=True,
+        ),
+        popup=folium.GeoJsonPopup(
+            fields=["display_district", "NAME", "area_sq_mi", "DATESTAMP"],
+            aliases=["District:", "Council Member / Title:", "Area (sq mi):", "Last Updated:"],
+            localize=True,
+        ),
+    ).add_to(m)
 
-  folium.LayerControl(position="topright").add_to(m)
+    # 2. Live Search / Geocoder Plugin (Top-left search bar)
+    Geocoder(add_marker=True, collapsed=False).add_to(m)
 
-  print(f"[4/4] Saving output to {output_path}...")
-  m.save(output_path)
-  print(f"Map successfully generated: {output_path}")
+    # 3. Overview Corner MiniMap Plugin (Bottom-right inset map)
+    MiniMap(toggle_display=True, tile_layer="OpenStreetMap").add_to(m)
+
+    folium.LayerControl(position="topright").add_to(m)
+
+    print(f"[4/4] Saving output to {output_path}...")
+    m.save(output_path)
+    print(f"Map successfully generated: {output_path}")
 
 
 def main():
-  gdf = fetch_spatial_data(ENDPOINT, PARAMS)
-  if gdf.empty:
-    print("Execution aborted: no spatial records available.", file=sys.stderr)
-    sys.exit(1)
+    gdf = fetch_spatial_data(ENDPOINT, PARAMS)
+    if gdf.empty:
+        print("Execution aborted: no spatial records available.", file=sys.stderr)
+        sys.exit(1)
 
-  enriched_gdf = clean_and_enrich_data(gdf)
-  build_map(enriched_gdf, OUTPUT_FILE)
+    enriched_gdf = clean_and_enrich_data(gdf)
+    build_map(enriched_gdf, OUTPUT_FILE)
 
 
 if __name__ == "__main__":
-  main()
+    main()
