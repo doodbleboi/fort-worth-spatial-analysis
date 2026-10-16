@@ -2,71 +2,51 @@ import folium
 import geopandas as gpd
 import requests
 
-# 1. Fort Worth Open Data Public FeatureServer Endpoints
-# Example: Council District Boundaries (Polygons) & Code Violations (Points)
-DISTRICTS_URL = "https://services.arcgis.com/8VkOubw30CJvGz6t/arcgis/rest/services/CFW_Council_Districts/FeatureServer/0/query"
-VIOLATIONS_URL = "https://services.arcgis.com/8VkOubw30CJvGz6t/arcgis/rest/services/CFW_Code_Violations_Points/FeatureServer/0/query"
+# Fort Worth Official MapServer Layer 2: Council Districts
+URL = "https://mapit.fortworthtexas.gov/ags/rest/services/CIVIC/OpenData_Boundaries/MapServer/2/query?outFields=*&where=1%3D1&f=geojson"
 
+print("Fetching Council Districts from mapit.fortworthtexas.gov...")
 
-def fetch_geojson(base_url, where_clause="1=1", limit=1000):
-  """Queries Fort Worth's ArcGIS REST API directly for GeoJSON."""
-  params = {
-      "where": where_clause,
-      "outFields": "*",
-      "f": "geojson",
-      "resultRecordCount": limit,
-  }
-  res = requests.get(base_url, params=params)
-  return gpd.read_file(res.text)
+# Add User-Agent header so the server accepts the script's connection
+headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+res = requests.get(URL, headers=headers)
+res.raise_for_status()
 
+# Parse GeoJSON directly into a GeoDataFrame
+data = res.json()
+gdf = gpd.GeoDataFrame.from_features(data["features"], crs="EPSG:4326")
 
-print("Fetching Council Districts...")
-districts_gdf = fetch_geojson(DISTRICTS_URL)
+print(f"Loaded {len(gdf)} Council Districts successfully.")
+print("Columns available:", list(gdf.columns))
 
-print("Fetching Code Violation points...")
-violations_gdf = fetch_geojson(
-    VIOLATIONS_URL, where_clause="STATUS = 'Open'", limit=500
-)
-
-# 2. Ensure Coordinate Systems Match (EPSG 4326 = standard Lat/Long WGS84)
-districts_gdf = districts_gdf.to_crs(epsg=4326)
-violations_gdf = violations_gdf.to_crs(epsg=4326)
-
-# 3. SPATIAL QUERY: Spatial Join / Point-in-Polygon intersection
-# Identifies which Council District each violation falls inside
-joined_gdf = gpd.sjoin(violations_gdf, districts_gdf, predicate="within")
-
-print(f"Successfully joined {len(joined_gdf)} points to districts.")
-print(joined_gdf[["CASE_NUMBER", "DISTRICT", "geometry"]].head())
-
-# 4. EXPORT TO INTERACTIVE WEB MAP
-# Centers map near Downtown Fort Worth (32.7555, -97.3308)
+# Initialize Folium interactive map centered on Fort Worth
 m = folium.Map(
     location=[32.7555, -97.3308], zoom_start=11, tiles="CartoDB positron"
 )
 
-# Add District outlines
+# Identify a district label column if present
+label_col = next(
+    (
+        col
+        for col in ["DISTRICT", "COUNCIL_DISTRICT", "NAME", "DIST_NAME"]
+        if col in gdf.columns
+    ),
+    gdf.columns[0],
+)
+
+# Draw district boundary polygons
 folium.GeoJson(
-    districts_gdf,
+    gdf,
     name="Council Districts",
     style_function=lambda x: {
-        "fillColor": "transparent",
+        "fillColor": "#3186cc",
+        "fillOpacity": 0.2,
         "color": "#1f77b4",
         "weight": 2,
     },
+    tooltip=folium.GeoJsonTooltip(fields=[label_col], aliases=["District: "]),
 ).add_to(m)
 
-# Add Violation points as clustered markers
-for _, row in joined_gdf.iterrows():
-  folium.CircleMarker(
-      location=[row.geometry.y, row.geometry.x],
-      radius=4,
-      color="#d62728",
-      fill=True,
-      fill_opacity=0.7,
-      popup=f"Case: {row.get('CASE_NUMBER', 'N/A')}<br>District: {row.get('DISTRICT', 'N/A')}",
-  ).add_to(m)
-
-# Save as index.html (ready for GitHub Pages)
+folium.LayerControl().add_to(m)
 m.save("index.html")
-print("Saved interactive map to index.html.")
+print("Saved interactive map to index.html!")
